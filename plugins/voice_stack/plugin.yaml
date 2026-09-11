@@ -1,0 +1,85 @@
+name: voice_stack
+version: 0.0.12
+description: "Local voice pipeline: Wake Word → STT → Hermes LLM → TTS → HA media_player."
+author: "rusty4444 <rusty4444@users.noreply.github.com>"
+hooks:
+  - on_session_start
+
+config:
+  # HA-facing WebSocket receiver
+  HERMES_HA_WS_ENABLED:
+    type: bool
+    default: true
+    description: Start the /api/hermes/ws receiver for the Home Assistant custom integration
+  HERMES_HA_WS_HOST:
+    type: str
+    default: 0.0.0.0
+    description: Listen host for the HA WebSocket receiver
+  HERMES_HA_WS_PORT:
+    type: int
+    default: 7860
+    description: Listen port for the HA WebSocket receiver
+  HERMES_HA_WS_PATH:
+    type: str
+    default: /api/hermes/ws
+    description: WebSocket path used by the HA custom integration
+  HERMES_HA_WS_TOKEN:
+    type: str
+    default: ""
+    description: Optional bearer token for HA WebSocket clients; falls back to API_SERVER_KEY/HERMES_API_KEY
+
+  # Wake Word engine: porcupine, openwakeword, command
+  HERMES_WAKE_WORD_ENGINE:
+    type: str
+    default: porcupine
+    description: Wake word engine
+  HERMES_WAKE_WORD:
+    type: str
+    default: computer
+    description: Wake word keyword
+
+  # STT engine: faster-whisper, whisper-cpp, command
+  HERMES_STT_ENGINE:
+    type: str
+    default: faster-whisper
+    description: Speech-to-text engine
+  HERMES_STT_MODEL:
+    type: str
+    default: tiny
+    description: STT model size (tiny, base, small, medium, large-v3)
+  HERMES_STT_CONFIDENCE:
+    type: float
+    default: 0.70
+    description: Minimum confidence threshold for voice input acceptance
+
+  # TTS engine: edge, piper, command
+  HERMES_TTS_ENGINE:
+    type: str
+    default: edge
+    description: Text-to-speech engine
+  HERMES_TTS_VOICE:
+    type: str
+    default: en-US-AriaNeural
+    description: TTS voice name
+
+  # Output
+  HERMES_MEDIA_PLAYER:
+    type: str
+    default: ""
+    description: HA media_player entity for TTS output (leave empty for local speakers)
+
+  # Pipeline
+  HERMES_RECORD_DURATION:
+    type: float
+    default: 10.0
+    description: Maximum recording duration in seconds
+  HERMES_SILENCE_TIMEOUT:
+    type: float
+    default: 2.0
+    description: Seconds of silence before ending recording
+
+  # Audio cache
+  HERMES_VOICE_CACHE:
+    type: str
+    default: ~/.hermes/voice_cache
+    description: Directory for cached TTS audio files
