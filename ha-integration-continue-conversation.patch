@@ -1,0 +1,12 @@
+diff --git a/custom_components/hermes/conversation.py b/custom_components/hermes/conversation.py
+index d4d28e9..7ef13db 100644
+--- a/custom_components/hermes/conversation.py
++++ b/custom_components/hermes/conversation.py
+@@ -151,4 +151,7 @@ class HermesConversationAgent(ConversationEntity):
+         return ConversationResult(
+             response=response,
+             conversation_id=result.get("conversation_id", conversation_id),
++            # Hermes sets this when its reply needs an answer (clarifying question);
++            # Assist satellites then reopen the mic after TTS without a wake word.
++            continue_conversation=bool(result.get("continue_conversation", False)),
+         )

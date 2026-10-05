@@ -12,9 +12,11 @@ Registered tools:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -357,7 +359,111 @@ def _append_history(conversation_id: Optional[str], user_text: str, assistant_te
     _CONVERSATION_LAST_ACTIVITY[conversation_id] = now
 
 
+# HA's conversation agent gives up after 30 s (see custom_components/hermes/__init__.py
+# in hermes-voice-ha-integration). Keep the whole LLM loop under that so HA always gets
+# a typed assist_response instead of "Hermes is not responding".
+_ASSIST_DEADLINE_SECONDS = float(os.getenv("HERMES_ASSIST_DEADLINE", "26"))
+_ASSIST_LLM_RETRIES = 1  # one retry for transient errors (e.g. a malformed tool call the server rejects)
+# Hermes toolsets offered to Assist queries besides the HA tools (comma-separated; "" = none), e.g. MCP servers'
+# runtime toolsets "mcp-<server>". Default: the qBArm robot arm (mcp_servers.qbarm in config.yaml).
+_ASSIST_EXTRA_TOOLSETS = [t.strip() for t in os.getenv("HERMES_ASSIST_EXTRA_TOOLSETS", "mcp-qbarm").split(",")
+                          if t.strip()]
+# the qBArm tools that take `wait` (used only if a call still comes through Hermes's tool_call bridge)
+_QBARM_WAIT_TOOLS = {"pick", "place", "hand_over", "take_from_hand", "go_home", "go_to", "start_robot", "stop_robot"}
+# MCP utility wrappers left out of the voice tool list (the model only needs the server's own tools)
+_ASSIST_SKIP_SUFFIXES = ("_list_resources", "_read_resource", "_list_prompts", "_get_prompt")
+
+
+def _assist_extra_tools() -> tuple[list[dict[str, Any]], dict[str, Any], set[str]]:
+    """The extra toolsets' tools for Assist: (schemas, dispatch, names). Calls go through Hermes's own dispatcher
+    (hooks, approvals) in a worker thread; a tool with a `wait` parameter gets wait=false, so a long action (a robot
+    arm's pick) answers at once instead of blowing HA's deadline."""
+    if not _ASSIST_EXTRA_TOOLSETS:
+        return [], {}, set()
+    try:
+        from model_tools import get_tool_definitions, handle_function_call
+        # the tools themselves, not Hermes's tool-search bridge (tool_search / tool_describe / tool_call): the
+        # bridge costs voice extra model rounds against HA's deadline and hides the tools' parameters
+        defs = get_tool_definitions(enabled_toolsets=_ASSIST_EXTRA_TOOLSETS, quiet_mode=True,
+                                    skip_tool_search_assembly=True)
+    except Exception as exc:
+        logger.warning("Assist: could not load toolsets %s: %s", _ASSIST_EXTRA_TOOLSETS, exc)
+        return [], {}, set()
+    schemas, dispatch, names = [], {}, set()
+    for d in defs:
+        fn = d.get("function", {})
+        name = fn.get("name", "")
+        if not name or name.endswith(_ASSIST_SKIP_SUFFIXES):
+            continue
+        schemas.append(d)
+        names.add(name)
+        has_wait = "wait" in ((fn.get("parameters") or {}).get("properties") or {})
+
+        def call(args, _name=name, _has_wait=has_wait):
+            args = dict(args or {})
+            if _has_wait:
+                args["wait"] = False
+            elif _name == "tool_call" and isinstance(args.get("arguments"), dict):   # (bridge, just in case)
+                args["arguments"] = {**args["arguments"], "wait": False} if args.get("name", "").startswith(
+                    "mcp__qbarm__") and args.get("name", "").split("__")[-1] in _QBARM_WAIT_TOOLS else args["arguments"]
+            logger.info("Assist tool call %s %s", _name, args)
+            return asyncio.to_thread(handle_function_call, _name, args, task_id="assist-query")
+        dispatch[name] = call
+    logger.info("Assist extra tools from %s: %s", _ASSIST_EXTRA_TOOLSETS,
+                ", ".join(f"{n}{'(wait)' if 'wait' in ((d.get('function', {}).get('parameters') or {}).get('properties') or {}) else ''}"
+                          for n, d in zip([d.get('function', {}).get('name') for d in schemas], schemas)))
+    return schemas, dispatch, names
+
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_STRAY_THINK_RE = re.compile(r"</?think>")
+
+
+def _clean_spoken_text(text: str) -> str:
+    """Strip reasoning tags a local model may leak into the spoken reply."""
+    text = _THINK_TAG_RE.sub("", text or "")
+    text = _STRAY_THINK_RE.sub("", text)
+    return text.strip()
+
+
+# Follow-up listening ("continue conversation"): when the reply needs an answer, HA
+# tells the satellite to reopen the mic after TTS without a wake word.
+#   HERMES_VOICE_CONTINUE = auto   -> [LISTEN] marker OR reply ending in "?"   (default)
+#                           marker -> only the explicit [LISTEN] marker
+#                           off    -> never
+_CONTINUE_MODE = os.getenv("HERMES_VOICE_CONTINUE", "auto").strip().lower()
+_LISTEN_MARKER_RE = re.compile(r"\s*\[\s*LISTEN\s*\]\s*", re.IGNORECASE)
+
+
+def _split_continue_marker(text: str) -> tuple[str, bool]:
+    """Return (spoken_text_without_marker, continue_conversation)."""
+    text = text or ""
+    has_marker = bool(_LISTEN_MARKER_RE.search(text))
+    spoken = _LISTEN_MARKER_RE.sub(" ", text).strip()
+    if _CONTINUE_MODE == "off":
+        return spoken, False
+    if has_marker:
+        return spoken, True
+    if _CONTINUE_MODE == "auto":
+        return spoken, spoken.rstrip().endswith("?")
+    return spoken, False
+
+
 async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the LLM tool loop under HA's response deadline."""
+    loop_task = asyncio.ensure_future(_assist_query_llm_loop(ctx, payload))
+    try:
+        return await asyncio.wait_for(loop_task, timeout=_ASSIST_DEADLINE_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("Assist query exceeded %.0fs deadline; returning timeout reply", _ASSIST_DEADLINE_SECONDS)
+        return {
+            "ok": False,
+            "text": "Sorry, that took too long. Please try again.",
+            "conversation_id": payload.get("conversation_id"),
+            "error": "assist_query deadline exceeded",
+        }
+
+
+async def _assist_query_llm_loop(ctx: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """Turn an HA Assist query into a Hermes LLM response with HA tool access.
 
     This handles the HA-side ``assist_query`` message introduced by the
@@ -424,6 +530,19 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         logger.warning("Could not load HA tools for assist query: %s", exc)
         tool_dispatch = {}
 
+    # 2b. Extra Hermes toolsets (MCP servers, e.g. the qBArm robot arm)
+    extra_tools, extra_dispatch, extra_names = _assist_extra_tools()
+    if extra_tools:
+        ha_tools = ha_tools + extra_tools
+        tool_dispatch = {**tool_dispatch, **extra_dispatch}
+        if any("qbarm" in n for n in extra_names):
+            system_prompt += (
+                "\n\nYou can also control the qBArm robot arm on the user's desk with the mcp__qbarm__* tools "
+                "(look at objects, pick, place, hand over, take from the hand, jog, home, claw, stop). Long actions "
+                "start and run on while you answer: say in one short sentence what you started (\"Picking up the "
+                "tape roll now\"). If the user says stop, call the stop tool at once. Directions are the user's "
+                "(left = their left, towards me = closer to them).")
+
     # Load previous conversation turns if present
     prior_history = _get_history(conversation_id)
 
@@ -435,7 +554,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
     # 3. Call LLM with tool loop
     from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
     import inspect
-    max_turns = 3
+    max_turns = 4  # e.g. look -> pick -> spoken answer
     final_text = ""
     provider = None
     model = None
@@ -450,20 +569,25 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         if ha_tools:
             call_kw["tools"] = ha_tools
 
-        try:
-            resp = await async_call_llm(**call_kw)
-        except Exception as exc:
-            logger.warning("Assist query async_call_llm failed, falling back to ctx.llm: %s", exc)
-            fallback_res = await ctx.llm.acomplete(
-                messages=messages,
-                max_tokens=512,
-                temperature=0.2,
-                purpose="voice_stack.assist_query",
-            )
-            final_text = (fallback_res.text or "").strip()
-            provider = getattr(fallback_res, "provider", None)
-            model = getattr(fallback_res, "model", None)
-            break
+        # Retry on the same (configured) route rather than falling back to ctx.llm: the
+        # generic fallback drops the HA tools and can wander through slow cloud providers,
+        # which blows past HA's deadline.
+        resp = None
+        for attempt in range(_ASSIST_LLM_RETRIES + 1):
+            try:
+                resp = await async_call_llm(**call_kw)
+                break
+            except Exception as exc:
+                if attempt < _ASSIST_LLM_RETRIES:
+                    logger.warning("Assist query LLM call failed (attempt %d), retrying: %s", attempt + 1, exc)
+                    continue
+                logger.error("Assist query LLM call failed: %s", exc)
+                return {
+                    "ok": False,
+                    "text": "Sorry, I couldn't reach the language model right now.",
+                    "conversation_id": conversation_id,
+                    "error": str(exc),
+                }
 
         provider = getattr(resp, "provider", None)
         model = getattr(resp, "model", None)
@@ -513,7 +637,7 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
                     "content": result_str,
                 })
         else:
-            final_text = extract_content_or_reasoning(resp).strip()
+            final_text = _clean_spoken_text(extract_content_or_reasoning(resp))
             if final_text:
                 break
 
@@ -526,12 +650,14 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
                 temperature=0.2,
                 max_tokens=256,
             )
-            final_text = extract_content_or_reasoning(summary_res).strip()
+            final_text = _clean_spoken_text(extract_content_or_reasoning(summary_res))
         except Exception:
             pass
 
     if not final_text:
         final_text = "I processed your request."
+
+    final_text, continue_conversation = _split_continue_marker(final_text)
 
     # Save turns to conversation history cache for multi-turn dialogue context
     _append_history(conversation_id, text, final_text)
@@ -542,6 +668,9 @@ async def _handle_assist_query_with_llm(ctx: Any, payload: dict[str, Any]) -> di
         "conversation_id": conversation_id,
         "provider": provider,
         "model": model,
+        # Forwarded verbatim in assist_response; the HA integration maps it onto
+        # ConversationResult(continue_conversation=...) so the satellite keeps listening.
+        "continue_conversation": continue_conversation,
     }
 
 
