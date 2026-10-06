@@ -369,7 +369,8 @@ _ASSIST_LLM_RETRIES = 1  # one retry for transient errors (e.g. a malformed tool
 _ASSIST_EXTRA_TOOLSETS = [t.strip() for t in os.getenv("HERMES_ASSIST_EXTRA_TOOLSETS", "mcp-qbarm").split(",")
                           if t.strip()]
 # the qBArm tools that take `wait` (used only if a call still comes through Hermes's tool_call bridge)
-_QBARM_WAIT_TOOLS = {"pick", "place", "hand_over", "take_from_hand", "go_home", "go_to", "start_robot", "stop_robot"}
+_QBARM_WAIT_TOOLS = {"pick", "place", "hand_over", "take_from_hand", "go_home", "go_to", "jog", "turn",
+                     "start_cell", "stop_cell"}
 # MCP utility wrappers left out of the voice tool list (the model only needs the server's own tools)
 _ASSIST_SKIP_SUFFIXES = ("_list_resources", "_read_resource", "_list_prompts", "_get_prompt")
 
